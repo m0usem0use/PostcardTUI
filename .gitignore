@@ -1,0 +1,9 @@
+# Runtime outputs — never commit audit/send data
+report-*.csv
+report-*.md
+mailaudit-report.*
+send-log-*.csv
+spoofable.txt
+dryrun-*/
+__pycache__/
+*.pyc
