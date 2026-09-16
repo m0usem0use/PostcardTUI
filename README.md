@@ -1,10 +1,10 @@
-# PostcardTUI 📮
+# PostcardTUI 
 
 ![PostcardTUI — the attack view and the defense view](docs/animated-hero.gif)
 
 **Email spoofability auditing & live-fire proof toolkit** — audit a domain portfolio, rank the holes, prove exploitation with a controlled send, and hand the owner the exact DNS fix.
 
-Owner-authorized security testing. Built for pentesters, MSPs, and domain owners who want evidence, not a PDF.
+Owner-authorized security testing. Built for pentesters, MSPs, and domain owners who want evidence, not a PDF.  Please don't use this to victimize anyone or I will be pissed and probably ask my much more talented friends to pop your calc.
 
 ---
 
