@@ -51,6 +51,7 @@ One script, zero dependencies (pure Python 3.10+ stdlib):
 - **Interactive wizard**: audit → rank → select → compose → dry-run/send
 - **Headless mode**: `--audit` / `--audit-file` with **exit code = worst severity (0–4)** — cron-friendly, CI-friendly
 - Writes ranked reports (CSV + Markdown) and `spoofable.txt` (CRITICAL-only list)
+- **DNS-existence aware (v2.1)**: NXDOMAIN domains are reported OK (nothing to lock down), SERVFAIL/resolver failures are reported as *unknown* — never a false CRITICAL; `spoofable.txt` and exit codes only reflect domains that verifiably exist
 - Everything persists to `~/.postcard_config.json` via the Settings menu — no file editing
 
 ## Quick start

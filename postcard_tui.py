@@ -15,7 +15,7 @@ from email.utils import make_msgid, formatdate
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
-VERSION = "2.0"
+VERSION = "2.1"
 # POSTCARD_HOME: override home for config/history (Docker mounts it to /data)
 _HOME = os.environ.get("POSTCARD_HOME") or os.path.expanduser("~")
 CONFIG_PATH = os.path.join(_HOME, ".postcard_config.json")
@@ -134,7 +134,11 @@ def pause(msg="\n(enter to continue)"):
 UA = {"User-Agent": "Mozilla/5.0"}
 
 def doh(name, rtype="TXT"):
-    """DoH with fallback: dns.google -> cloudflare-dns.com."""
+    """DoH with fallback: dns.google -> cloudflare-dns.com.
+    Returns (answers, status): status is 'ok' | 'nxdomain' | 'servfail' | 'error'.
+    nxdomain = name provably does not exist; servfail = authoritative servers
+    failed (record existence UNKNOWN); error = network/resolver failure (also
+    unknown). Callers MUST treat servfail/error as no-data, not as no-record."""
     resolvers = [
         f"https://dns.google/resolve?name={name}&type={rtype}",
         f"https://cloudflare-dns.com/dns-query?name={name}&type={rtype}",
@@ -144,14 +148,20 @@ def doh(name, rtype="TXT"):
             try:
                 req = urllib.request.Request(url, headers={**UA, "Accept": "application/dns-json"})
                 d = json.loads(urllib.request.urlopen(req, timeout=10).read())
-                return [a["data"].strip('"') for a in d.get("Answer", []) if a["type"] in (15, 16, 1)]
+                rc = d.get("Status", 0)
+                answers = [a["data"].strip('"') for a in d.get("Answer", []) if a["type"] in (15, 16, 1)]
+                if rc == 3:
+                    return [], "nxdomain"          # authoritative: name does not exist
+                if rc not in (0, 3):
+                    return [], "servfail"           # 2=SERVFAIL etc: existence unknown
+                return answers, "ok"
             except Exception:
                 time.sleep(1 + attempt)
-    return []
+    return [], "error"
 
 def resolve_mx(domain):
     """Return (priority, host) lowest-priority MX, or None."""
-    rows = doh(domain, "MX")
+    rows, _st = doh(domain, "MX")
     best = None
     for r in rows:
         parts = r.split()
@@ -202,8 +212,29 @@ def _parse_spf(spf):
 def audit(domain):
     r = {"domain": domain, "spf": None, "dmarc": None, "dmarc_sub": None,
          "dkim": None, "mx": False, "site": "?", "sev": 0, "verdict": "",
-         "notes": [], "raw": {}}
-    a = doh(domain, "A")
+         "notes": [], "raw": {}, "dns_status": "ok"}
+    a, a_st = doh(domain, "A")
+    if a_st == "nxdomain":
+        # Authoritative NXDOMAIN: the domain does not exist at all. Verify once
+        # against the fallback resolver (registry TTL, transient NS failures) --
+        # if the second resolver sees records, audit normally.
+        a2, st2 = doh(f"dns.{domain}", "TXT")
+        if st2 != "nxdomain":
+            a_st = "ok"
+        else:
+            r["dns_status"] = "nxdomain"
+            r["site"] = "NXDOMAIN (does not exist)"
+            labels = domain.split(".")
+            parent = ".".join(labels[1:]) if len(labels) >= 3 else None
+            hint = (f" if you meant the parent {parent}, audit THAT" if parent
+                    else " consider registering it so nobody can spoof from it")
+            r["sev"], r["verdict"] = 0, f"OK - does not exist (NXDOMAIN, apex + probe query): nothing to lock down;{hint}"
+            return r
+    elif a_st == "error":
+        r["dns_status"] = "error"
+        r["site"] = "DNS ERROR (existence unknown)"
+        r["sev"], r["verdict"] = 1, "LOW - DNS lookup failed (resolver/network issue): record status UNKNOWN - re-run before acting"
+        return r
     if a:
         try:
             resp = urllib.request.urlopen(urllib.request.Request(
@@ -222,22 +253,36 @@ def audit(domain):
     else:
         r["site"] = "no A record"
 
-    for t in doh(domain):
+    _txt, txt_st = doh(domain)
+    for t in _txt:
         if t.lower().startswith("v=spf1"):
             r["spf"] = t
-    for t in doh(f"_dmarc.{domain}"):
+    _dm, dm_st = doh(f"_dmarc.{domain}")
+    for t in _dm:
         if t.lower().startswith("v=dmarc1"):
             r["dmarc"] = t
     # subdomain policy: sp= is read from the org record itself during parsing
     for sel in ("google", "selector1", "selector2", "default", "dkim",
                 "k1", "s1", "mail", "zoho", "mandrill", "k2", "protonmail"):
-        dk = doh(f"{sel}._domainkey.{domain}")
+        dk, _dst = doh(f"{sel}._domainkey.{domain}")
         if dk:
             r["dkim"] = f"{sel}: {dk[0][:60]}{'...' if len(dk[0]) > 60 else ''}"
             break
-    r["mx"] = bool(doh(domain, "MX"))
+    _mx, mx_st = doh(domain, "MX")
+    r["mx"] = bool(_mx)
     r["raw"]["spf"] = r["spf"] or ""
     r["raw"]["dmarc"] = r["dmarc"] or ""
+    # SERVFAIL on the apex zone while A was fine: record existence unverifiable.
+    # Only override the verdict if we learned NOTHING about the email posture;
+    # otherwise downgrade the failed lookup to a note.
+    failed = [n for n, st in (("TXT", txt_st), ("DMARC", dm_st), ("MX", mx_st))
+              if st in ("servfail", "error")]
+    if failed:
+        r["dns_status"] = "servfail"
+        if not r["spf"] and not r["dmarc"]:
+            r["sev"], r["verdict"] = 1, "LOW - DNS SERVFAIL from authoritative servers: records unreadable (existence UNKNOWN) - re-run before acting"
+            return r
+        r["notes"].append(f"DNS {', '.join(failed)} lookup failed (SERVFAIL): partial data only")
 
     # ---- DMARC policy parse (incl. sp=, pct=) ----
     dmarc = (r["dmarc"] or "").lower()
@@ -258,9 +303,14 @@ def audit(domain):
         spf_pol, plus_all, spf_lookups, spf_note = _parse_spf(r["spf"])
 
     # ---- classification (receiver-behavior aware) ----
+    # NOTE: site status NEVER changes the spoof verdict (site != email). A
+    # registered domain with zero records is spoofable whether or not a site
+    # resolves -- CRITICAL stands; only the guidance note below differs.
     if not r["dmarc"]:
         if spf_pol in ("none", "?all"):
             r["sev"], r["verdict"] = 4, "CRITICAL - fully spoofable (no DMARC; SPF absent or ?all)"
+            if not a:
+                r["notes"].append("registered domain, no site (no A record): spoofing needs no site - lock down with 'v=spf1 -all' + 'p=reject'")
         else:
             r["sev"], r["verdict"] = 3, "HIGH - SPF present but no DMARC policy"
         if plus_all:
@@ -350,6 +400,9 @@ def run_audit(domains):
     counts = {}
     for r in results:
         counts[r["sev"]] = counts.get(r["sev"], 0) + 1
+    nonexist = sum(1 for r in results if r.get("dns_status") == "nxdomain")
+    if nonexist:
+        print(dim(f"  ({nonexist} domain(s) do not exist (NXDOMAIN) - excluded from action counts; see OK/INFO rows)"))
     print("-" * 120)
     print("  ".join(f"{SEVS[s]}: {counts[s]}" for s in (4, 3, 2, 1, 0) if counts.get(s)))
     print(dim(f"done in {time.time()-t0:.1f}s"))
@@ -378,7 +431,7 @@ def run_audit(domains):
                     f"{'yes' if r['mx'] else 'no'} | {'; '.join(r['notes'])} |\n")
     with open("spoofable.txt", "w") as f:
         for r in results:
-            if r["sev"] == 4:
+            if r["sev"] == 4 and r.get("dns_status", "ok") == "ok":
                 f.write(r["domain"] + "\n")
     print(good(f"reports written: {csv_path}, {md_path}  (spoofable.txt = CRITICAL-only list)"))
     return results
@@ -391,7 +444,7 @@ def save_results(results):
             for r in results:
                 f.write(json.dumps({
                     "ts": datetime.now().strftime("%Y-%m-%d %H:%M"),
-                    "domain": r["domain"], "sev": r["sev"], "verdict": r["verdict"],
+                    "domain": r["domain"], "sev": r["sev"], "verdict": r["verdict"],                    "dns_status": r.get("dns_status", "ok"),
                     "spf": r["spf"], "dmarc": r["dmarc"], "dkim": r.get("dkim"),
                 }) + "\n")
         return True

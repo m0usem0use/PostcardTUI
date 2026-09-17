@@ -1,5 +1,14 @@
 # Changelog
 
+## v2.1 — 2026-09-17 — DNS-existence awareness (false-CRITICAL fix)
+
+### Fixed
+- **NXDOMAIN no longer reported CRITICAL**: a domain that does not exist (confirmed by apex + probe query) now returns **OK — nothing to lock down**, is excluded from the CRITICAL action count and from `spoofable.txt`, and hints at the parent domain when you audit a subdomain/hostname by mistake
+- **DNS SERVFAIL / resolver failure no longer yields a spoof verdict**: record existence is *unknown* → verdict is LOW "re-run before acting" instead of a bare CRITICAL built from zero data (a transient DoH outage could previously flag whole lists CRITICAL)
+- Partial SERVFAIL (some lookups answered): verdict stands, failure noted per lookup
+- Registered recordless domains stay **CRITICAL** (spoofing needs no website) but the verdict now says exactly that — "no site: spoofing needs no site — lock down with `v=spf1 -all` + `p=reject`"
+
+
 ## v2.0 — 2026-09-12
 
 **The false-confidence release.** Classifier rebuilt from "do records exist" to receiver-behavior calibration.
